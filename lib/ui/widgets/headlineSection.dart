@@ -5,7 +5,7 @@ import '../../main.dart';
 class HeadlineSection extends StatelessWidget {
 
 
-  const HeadlineSection({super.key});
+  const HeadlineSection({super.key, required bool isDarkMode});
 
   @override
   Widget build(BuildContext context) {
