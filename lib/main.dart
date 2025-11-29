@@ -1,7 +1,17 @@
 import 'package:flutter/material.dart';
-import 'package:snaprecipes/ui/widgets/customAppBar.dart';
+import 'package:image_picker/image_picker.dart';
+import 'dart:io';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:snaprecipes/ui/pages/recipe_results_page.dart';
 import 'package:snaprecipes/ui/widgets/headlineSection.dart';
 import 'package:snaprecipes/ui/widgets/ingredientChip.dart';
+
+
+// --- Configuração da API (Substitua por sua chave real) ---
+// Em um projeto real, esta chave deve ser armazenada de forma segura (e.g., variáveis de ambiente)
+const String _geminiApiKey = 'AIzaSyDEphoPAFuvb7StLLhxUaz9O3yd_3ly8Fg';
+const String _geminiModel = 'gemini-2.5-flash-preview-09-2025';
 
 // Note: Em um projeto real, você usaria um tema (ThemeData) para isso.
 // Cores (Mapeamento direto dos valores hex do Tailwind)
@@ -15,11 +25,9 @@ const Color subtleDark = Color(0xFF21361c);
 const Color borderLight = Color(0xFFdce5d9);
 const Color borderDark = Color(0xFF304d2a);
 // Fonte (Simulação da Plus Jakarta Sans, usando a fonte padrão do Flutter)
-const String fontDisplay = 'Plus Jakarta Sans'; // Você precisaria adicionar esta fonte ao pubspec.yaml
+const String fontDisplay = 'Plus Jakarta Sans';
 
 // --------------------------------------------------------------------
-
-
 
 void main() {
   runApp(const RecipeApp());
@@ -36,7 +44,6 @@ class RecipeApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         fontFamily: fontDisplay,
-        // Configurações básicas de tema (simulando o modo claro)
         scaffoldBackgroundColor: backgroundLight,
         textTheme: const TextTheme(
           bodyMedium: TextStyle(color: textLight),
@@ -45,12 +52,12 @@ class RecipeApp extends StatelessWidget {
         colorScheme: const ColorScheme.light(
           primary: primaryColor,
           background: backgroundLight,
+          surface: backgroundLight, // Surface para elementos como dialogs
         ),
         useMaterial3: true,
       ),
       darkTheme: ThemeData(
         fontFamily: fontDisplay,
-        // Configurações básicas de tema (simulando o modo escuro)
         scaffoldBackgroundColor: backgroundDark,
         textTheme: const TextTheme(
           bodyMedium: TextStyle(color: textDark),
@@ -59,102 +66,386 @@ class RecipeApp extends StatelessWidget {
         colorScheme: const ColorScheme.dark(
           primary: primaryColor,
           background: backgroundDark,
+          surface: backgroundDark, // Surface para elementos como dialogs
         ),
         useMaterial3: true,
       ),
-      home: const MainPage(isDarkMode: false), // Defina isDarkMode conforme o estado do app
+      home: const MainPage(isDarkMode: false),
     );
   }
 }
 
-class MainPage extends StatelessWidget {
+// --------------------------------------------------------------------
+// MainPage agora é um StatefulWidget para gerenciar o estado da câmera e da IA
+// --------------------------------------------------------------------
+class MainPage extends StatefulWidget {
   final bool isDarkMode;
   const MainPage({super.key, required this.isDarkMode});
 
+  @override
+  State<MainPage> createState() => _MainPageState();
+}
+
+class _MainPageState extends State<MainPage> {
+  // Estado para a Imagem capturada
+  XFile? _pickedImage;
+  // Estado para a lista de Ingredientes (inicializada com simulação)
+  List<String> _identifiedIngredients = ['Tomate', 'Cebola', 'Manjericão'];
+  // Estado de Carregamento para a Análise de IA
+  bool _isLoading = false;
+
+  final ImagePicker _picker = ImagePicker();
+
+  // --- Funções de API e Câmera ---
+
+  // Função utilitária para chamar a API com Backoff Exponencial
+  Future<http.Response> _backoffFetch(
+      String url, {
+        Map<String, String>? headers,
+        Object? body,
+        int maxRetries = 5,
+      }) async {
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        final response = await http.post(
+          Uri.parse(url),
+          headers: headers,
+          body: body,
+        ).timeout(const Duration(seconds: 30));
+
+        if (response.statusCode < 500 && response.statusCode != 429) {
+          return response;
+        }
+
+        print('Tentativa ${attempt + 1} falhou com status ${response.statusCode}. Retrying...');
+
+      } catch (e) {
+        print('Tentativa ${attempt + 1} falhou com erro: $e. Retrying...');
+      }
+
+      if (attempt == maxRetries - 1) break;
+
+      final delay = Duration(seconds: 1 << attempt);
+      await Future.delayed(delay);
+    }
+    throw Exception('Falha ao se conectar com a API após $maxRetries tentativas.');
+  }
+
+  // Função principal para analisar a imagem e extrair ingredientes com a IA
+  Future<void> _analyzeImageForIngredients(XFile imageFile) async {
+    // Verifica se a chave foi configurada.
+    if (_geminiApiKey.isEmpty || _geminiApiKey == 'SUA_CHAVE_AQUI') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('ERRO: Por favor, insira sua chave da API Gemini em _geminiApiKey.')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      // 1. Converter a imagem para Base64
+      final bytes = await File(imageFile.path).readAsBytes();
+      final base64Image = base64Encode(bytes);
+      final mimeType = imageFile.mimeType ?? 'image/jpeg';
+
+      // 2. Montar o Payload da API (Solicitando JSON estruturado)
+      final userPrompt = "Esta é uma foto de ingredientes de cozinha. Identifique todos os ingredientes comestíveis visíveis na imagem. Retorne apenas uma lista JSON no formato: {\"ingredients\": [\"nome_do_ingrediente_1\", \"nome_do_ingrediente_2\", ...]}";
+
+      final payload = jsonEncode({
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {"text": userPrompt},
+              {
+                "inlineData": {
+                  "mimeType": mimeType,
+                  "data": base64Image,
+                },
+              }
+            ]
+          }
+        ],
+        "generationConfig": { // <-- CORREÇÃO: Usa generationConfig
+          "responseMimeType": "application/json",
+          "responseSchema": {
+            "type": "OBJECT",
+            "properties": {
+              "ingredients": {
+                "type": "ARRAY",
+                "items": {"type": "STRING"}
+              }
+            },
+            "required": ["ingredients"]
+          }
+        }
+      });
+
+      // 3. Chamar a API
+      final apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/$_geminiModel:generateContent?key=$_geminiApiKey';
+
+      final response = await _backoffFetch(
+        apiUrl,
+        headers: {'Content-Type': 'application/json'},
+        body: payload,
+      );
+
+      // 4. Processar a Resposta
+      if (response.statusCode == 200) {
+        final apiResponse = jsonDecode(response.body);
+        final jsonText = apiResponse['candidates'][0]['content']['parts'][0]['text'];
+        final parsedJson = jsonDecode(jsonText);
+
+        final newIngredients = (parsedJson['ingredients'] as List<dynamic>)
+            .map((item) => item.toString())
+            .where((name) => name.isNotEmpty)
+            .toList();
+
+        if (newIngredients.isNotEmpty) {
+          setState(() {
+            // Adiciona novos ingredientes, evitando duplicatas.
+            for (var ing in newIngredients) {
+              if (!_identifiedIngredients.contains(ing)) {
+                _identifiedIngredients.add(ing);
+              }
+            }
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Sucesso! Ingredientes identificados: ${newIngredients.join(', ')}')),
+          );
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('A IA não identificou ingredientes na imagem. Tente novamente.')),
+          );
+        }
+
+      } else {
+        // Logar o corpo da resposta em caso de falha na API
+        throw Exception('Falha na API: ${response.statusCode}. Corpo: ${response.body}');
+      }
+    } catch (e) {
+      print('Erro na análise de IA: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Erro ao analisar a imagem. Verifique o console.')),
+      );
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  // Função para abrir a câmera, capturar e iniciar a análise
+  Future<void> _openCamera() async {
+    if (_isLoading) return;
+
+    try {
+      final XFile? image = await _picker.pickImage(
+        source: ImageSource.camera,
+        preferredCameraDevice: CameraDevice.rear,
+        imageQuality: 70,
+      );
+
+      if (image != null) {
+        setState(() {
+          _pickedImage = image;
+        });
+
+        // Inicia a análise da imagem
+        await _analyzeImageForIngredients(image);
+      }
+    } catch (e) {
+      print('Erro ao abrir a câmera: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Erro ao acessar a câmera: $e. Verifique as permissões.')),
+      );
+    }
+  }
+
+  // Função para remover ingrediente
+  void _removeIngredient(String ingredient) {
+    setState(() {
+      _identifiedIngredients.remove(ingredient);
+    });
+  }
+
+  // Função para adicionar ingrediente manualmente (NOVA)
+  void _addManualIngredient(String ingredient) {
+    final capitalized = ingredient.trim().isNotEmpty
+        ? ingredient.trim()[0].toUpperCase() + ingredient.trim().substring(1).toLowerCase()
+        : '';
+
+    if (capitalized.isNotEmpty && !_identifiedIngredients.contains(capitalized)) {
+      setState(() {
+        _identifiedIngredients.add(capitalized);
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Ingrediente "$capitalized" adicionado!')),
+      );
+    }
+  }
+
+  // Função para exibir o modal de adição manual (NOVA)
+  void _showAddManualIngredientDialog() {
+    String newIngredient = '';
+    final isCurrentDarkMode = Theme.of(context).brightness == Brightness.dark;
+
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.0)),
+          backgroundColor: isCurrentDarkMode ? backgroundDark : backgroundLight,
+          title: Text(
+              'Adicionar Ingrediente',
+              style: TextStyle(color: getTextColor(), fontWeight: FontWeight.bold)
+          ),
+          content: TextField(
+            autofocus: true,
+            decoration: InputDecoration(
+              hintText: 'Ex: Batata, Cenoura...',
+              hintStyle: TextStyle(color: getTextColor().withOpacity(0.5)),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12.0),
+                borderSide: BorderSide(color: getBorderColor()),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12.0),
+                borderSide: const BorderSide(color: primaryColor, width: 2),
+              ),
+            ),
+            style: TextStyle(color: getTextColor()),
+            onChanged: (value) {
+              newIngredient = value;
+            },
+            onSubmitted: (value) {
+              _addManualIngredient(value);
+              Navigator.of(context).pop();
+            },
+          ),
+          actions: <Widget>[
+            TextButton(
+              child: Text('Cancelar', style: TextStyle(color: getTextColor().withOpacity(0.7))),
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+            ),
+            ElevatedButton(
+              onPressed: () {
+                _addManualIngredient(newIngredient);
+                Navigator.of(context).pop();
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: primaryColor,
+                foregroundColor: textLight,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12.0)),
+              ),
+              child: const Text('Adicionar'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // Função para buscar receitas (ATUALIZADA)
+  void _searchRecipes() {
+    if (_identifiedIngredients.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Adicione pelo menos um ingrediente para buscar receitas!')),
+      );
+      return;
+    }
+
+    // NAVEGAÇÃO PARA A TELA DE RESULTADOS
+    final isCurrentDarkMode = Theme.of(context).brightness == Brightness.dark;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => RecipeResultsPage(
+          ingredients: _identifiedIngredients,
+          isDarkMode: isCurrentDarkMode,
+        ),
+      ),
+    );
+  }
+
+
+  // --- Widgets de Construção da UI (usando as novas funções de estado) ---
+
   // Função auxiliar para obter a cor correta baseada no modo
-  Color getTextColor() => isDarkMode ? textDark : textLight;
-  Color getBgColor() => isDarkMode ? backgroundDark : backgroundLight;
-  Color getSubtleBgColor() => isDarkMode ? subtleDark : subtleLight;
-  Color getBorderColor() => isDarkMode ? borderDark : borderLight;
+  Color getTextColor() => Theme.of(context).brightness == Brightness.dark ? textDark : textLight;
+  Color getSubtleBgColor() => Theme.of(context).brightness == Brightness.dark ? subtleDark : subtleLight;
+  Color getBorderColor() => Theme.of(context).brightness == Brightness.dark ? borderDark : borderLight;
 
   @override
   Widget build(BuildContext context) {
-    // Media Query para acessar o modo de cor atual do sistema, se não for forçado
-    final isCurrentDarkMode = isDarkMode || Theme.of(context).brightness == Brightness.dark;
+    // Tenta usar o brilho do tema se o widget.isDarkMode for false
+    final isCurrentDarkMode = widget.isDarkMode || Theme.of(context).brightness == Brightness.dark;
 
     return Scaffold(
-      // AppBar (Top App Bar)
-      appBar: CustomAppBar(isDarkMode: isDarkMode),
+      appBar: CustomAppBar(isDarkMode: isCurrentDarkMode), // Usando o tema atual
 
-      // Corpo Principal (Main Content)
       body: Column(
         children: <Widget>[
-          // Conteúdo central que irá se expandir (Headline, Botão da Câmera, Ingredientes)
           Expanded(
-            child: SingleChildScrollView( // Para garantir que a tela seja rolável, se necessário
+            child: SingleChildScrollView(
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 32.0),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.center,
                   children: <Widget>[
-                    // Headline & Body Text
-                    HeadlineSection(),
+                    HeadlineSection(isDarkMode: isCurrentDarkMode),
 
-                    // Main Action: Camera Button
                     _buildCameraButton(),
 
-                    // Identified Ingredients Section
                     _buildIngredientsSection(isCurrentDarkMode),
                   ],
                 ),
               ),
             ),
           ),
-
-          // Bottom Action Button (Footer)
           _buildFooterButton(isCurrentDarkMode),
-
         ],
       ),
     );
   }
 
-  // --- Widgets de Construção da UI ---
-
-
-  // 3. Camera Button
+  // 3. Camera Button (Atualizado para chamar a função de câmera e mostrar o loading)
   Widget _buildCameraButton() {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 40.0),
       child: Container(
-        width: 192, // w-48 (48 * 4 = 192)
-        height: 192, // h-48
+        width: 192,
+        height: 192,
         decoration: BoxDecoration(
           color: primaryColor,
           shape: BoxShape.circle,
           boxShadow: [
             BoxShadow(
-              color: primaryColor.withOpacity(0.3), // shadow-primary/30
+              color: primaryColor.withOpacity(0.3),
               spreadRadius: 0,
-              blurRadius: 10, // Simulação de shadow-lg
+              blurRadius: 10,
               offset: const Offset(0, 4),
             ),
           ],
         ),
         child: Material(
           color: Colors.transparent,
-          borderRadius: BorderRadius.circular(9999), // rounded-full
+          borderRadius: BorderRadius.circular(9999),
           child: InkWell(
-            onTap: () {
-              // Ação do botão da Câmera
-              print('Abrir Câmera');
-            },
+            onTap: _isLoading ? null : _openCamera, // Desabilita durante o carregamento
             borderRadius: BorderRadius.circular(9999),
-            child: const Center(
-              child: Icon(
-                Icons.photo_camera,
-                color: textLight, // text-text-light
-                size: 80, // !text-7xl (cerca de 72-80px)
+            child: Center(
+              child: _isLoading
+                  ? const CircularProgressIndicator(color: textLight) // Indicador de carregamento
+                  : Icon(
+                _pickedImage == null ? Icons.photo_camera : Icons.check_circle_outline,
+                color: textLight,
+                size: 80,
               ),
             ),
           ),
@@ -163,15 +454,14 @@ class MainPage extends StatelessWidget {
     );
   }
 
-  // 4. Ingredients Section
+  // 4. Ingredients Section (Atualizado para usar o estado real)
   Widget _buildIngredientsSection(bool isCurrentDarkMode) {
-    final List<String> ingredients = ['Tomate', 'Cebola', 'Manjericão'];
-    final Color subtleBgColor = isCurrentDarkMode ? subtleDark : subtleLight;
-    final Color borderColor = isCurrentDarkMode ? borderDark : borderLight;
+    final Color subtleBgColor = getSubtleBgColor();
+    final Color borderColor = getBorderColor();
 
     return Container(
-      width: double.infinity, // w-full
-      constraints: const BoxConstraints(maxWidth: 480), // max-w-lg mx-auto
+      width: double.infinity,
+      constraints: const BoxConstraints(maxWidth: 480),
       padding: const EdgeInsets.only(bottom: 16.0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -194,37 +484,30 @@ class MainPage extends StatelessWidget {
             padding: const EdgeInsets.all(16.0),
             decoration: BoxDecoration(
               color: subtleBgColor,
-              borderRadius: BorderRadius.circular(16.0), // rounded-xl
+              borderRadius: BorderRadius.circular(16.0),
               border: Border.all(color: borderColor),
             ),
-
-            child:
-            Wrap(
-              spacing: 12.0, // gap-3 (Tailwind usa 12px para gap-3)
+            child: _identifiedIngredients.isNotEmpty
+                ? Wrap(
+              spacing: 12.0,
               runSpacing: 12.0,
-              children: ingredients.map((name) => IngredientChip(
+              children: _identifiedIngredients.map((name) => IngredientChip(
                 name: name,
-                isDarkMode: isDarkMode, // Passar o estado correto aqui
-                onRemove: () {
-                  print('Remover Tomate');
-                  // Adicionar lógica de estado para remover o chip da lista
-                },
+                isDarkMode: isCurrentDarkMode, // Passa o modo atual
+                onRemove: () => _removeIngredient(name), // Usa a função de remoção
               )).toList(),
-            ),
-            // Se precisar do Empty State, descomentar o código abaixo:
-            /*
-            child: const Center(
+            )
+                : Center( // Empty State adaptado
               heightFactor: 2.5,
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: <Widget>[
-                  Icon(Icons.image_search, size: 40, color: textLight.withOpacity(0.6)),
-                  SizedBox(height: 8),
-                  Text('Aguardando imagem para identificar...', style: TextStyle(fontSize: 14, color: textLight.withOpacity(0.6))),
+                  Icon(Icons.image_search, size: 40, color: getTextColor().withOpacity(0.6)),
+                  const SizedBox(height: 8),
+                  Text('Aguardando imagem para identificar...', style: TextStyle(fontSize: 14, color: getTextColor().withOpacity(0.6))),
                 ],
               ),
             ),
-            */
           ),
 
           // Link Adicionar manualmente
@@ -232,9 +515,7 @@ class MainPage extends StatelessWidget {
             padding: const EdgeInsets.only(top: 12.0),
             child: Center(
               child: TextButton(
-                onPressed: () {
-                  print('Adicionar manualmente');
-                },
+                onPressed: _showAddManualIngredientDialog, // Chama o novo modal
                 child: const Text(
                   'Adicionar ingrediente manualmente',
                   style: TextStyle(
@@ -253,48 +534,64 @@ class MainPage extends StatelessWidget {
     );
   }
 
-  // 4.1. Ingredient Chip
-
-  // 5. Footer Button
+  // 5. Footer Button (Atualizado para desabilitar no loading e chamar a função de busca)
   Widget _buildFooterButton(bool isCurrentDarkMode) {
-    final Color footerBgColor = isCurrentDarkMode ? backgroundDark : backgroundLight;
-
     return Container(
-      margin: EdgeInsetsGeometry.only(right: 0,left: 0,top: 0,bottom: 20),
-      // Simulação do gradiente 'bg-gradient-to-t from-background-light to-transparent'
-      decoration: BoxDecoration(
-
-
-      ),
+      margin: const EdgeInsets.only(right: 0,left: 0,top: 0,bottom: 20),
       padding: const EdgeInsets.all(16.0),
       child: Center(
         child: SizedBox(
-
-          width: 480, // max-w-[480px]
-          height: 56, // h-14
+          width: 480,
+          height: 56,
           child: ElevatedButton(
-            onPressed: () {
-              print('Buscar Receitas');
-            },
+            onPressed: _isLoading || _identifiedIngredients.isEmpty ? null : _searchRecipes, // Desabilita se estiver carregando ou sem ingredientes
             style: ElevatedButton.styleFrom(
               backgroundColor: primaryColor,
               foregroundColor: textLight,
-
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(20.0), // rounded-xl
+                borderRadius: BorderRadius.circular(20.0),
               ),
-              elevation: 8, // Simulação de shadow-lg
-              shadowColor: primaryColor.withOpacity(0.3), // shadow-primary/30
+              elevation: 8,
+              shadowColor: primaryColor.withOpacity(0.3),
               textStyle: const TextStyle(
                 fontSize: 16,
                 fontWeight: FontWeight.bold,
                 letterSpacing: 0.2,
               ),
             ),
-            child: const Text('Buscar Receitas'),
+            child: Text(_isLoading ? 'Analisando Ingredientes...' : 'Buscar Receitas'),
           ),
         ),
       ),
     );
   }
+}
+
+// --------------------------------------------------------------------
+// IMPLEMENTAÇÃO DOS WIDGETS CUSTOMIZADOS FALTANTES
+// --------------------------------------------------------------------
+
+// 1. CustomAppBar
+class CustomAppBar extends StatelessWidget implements PreferredSizeWidget {
+  final bool isDarkMode;
+  const CustomAppBar({super.key, required this.isDarkMode});
+
+  Color getIconColor() => isDarkMode ? textDark : textLight;
+
+  @override
+  Widget build(BuildContext context) {
+    return AppBar(
+      title: const Text('SnapRecipes', style: TextStyle(fontWeight: FontWeight.bold)),
+      backgroundColor: isDarkMode ? backgroundDark : backgroundLight,
+      elevation: 0,
+      centerTitle: false,
+      leading: IconButton(icon: Icon(Icons.menu, color: getIconColor()), onPressed: () {}),
+      actions: [
+        IconButton(icon: Icon(Icons.person_outline, color: getIconColor()), onPressed: () {}),
+      ],
+    );
+  }
+
+  @override
+  Size get preferredSize => const Size.fromHeight(kToolbarHeight);
 }
