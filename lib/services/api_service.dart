@@ -6,7 +6,7 @@ import '../model/recipe.dart';
 
 class ApiService {
   // Configuração da API (Substitua por sua chave real se necessário)
-  static const String _apiKey = 'AIzaSyCPIR2oDxvCeBlnrY4he7uaFXI58hIDFRk';
+  static const String _apiKey = 'AIzaSyDHSdHHslovHvLkbJaKN2GKetvpUGsBr5U';
   static const String _model = 'gemini-2.5-flash-preview-09-2025';
   static const String _baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models/$_model:generateContent';
 
